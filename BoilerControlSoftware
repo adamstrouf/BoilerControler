@@ -1,0 +1,1104 @@
+/*This software is for a temperature controller based on the Arduino UNO R3 board with
+  an LCD display on pins 4, 5, 6, 7, 8, and 9; backlight control on pin 10; and has a built
+  in 5 button resistive keypad on A0. Output to a relay board for controlling two pumps and
+  a fan are on pins  11, 12, and 13; thermistor analog inputs for meausering temperature are on
+  pins A1, A2, and A3. There is a menu system for adjusting temeratures, range, calibration, and back
+  light level. The temperature control measures the sensors, prints the temperatures, compares to set temps
+  and calibrations, and switchs the relays as needed.
+
+  Created 12/26/2015
+  By: Adam Strouf
+
+  Based from code by:
+  For using a themistor: lady ada; https://learn.adafruit.com/thermistor/using-a-thermistor
+  For the menu: Author: Fahmi Ghani Date: 5 July 2015 Project: LCD Menu Function Component: LCD Keypad shield
+
+  XXFeb2018: Modified the code to use for a wood boiler. Original program was for a glycol cooling system. 
+             Changed variable names. Rewrote code for heating. Added relay to control blower on boiler on pin 3.
+  12Dec2019: Added an overheat function to the program.
+  01Mar2020: Start of major change of system and controler.
+             Added a thermocouple to boiler flue and an amplfier that outputs an analog signal to A4.
+             Added a function to read thermocouple. Added boiler_state function.
+  XXMar2020: Added a relay to pin 2 to control a 120V AC pilot to a contactor to control a waterheater.
+             Added a operation mode function to the menu, and a maintenance sub menu with manual controls for each output.
+             Added boolean values to control the outputs and modified code as neccesary.
+             Added all_off function. Added MainControl function. Modified temp_control funtion.
+  27Mar2020: Compiled a new bootloader for the UNO R3 to optiboot 8 with the LED_START_FLASHES=0 option to stop pin 13 from being active on reset.
+             IF THE ARDUINO IS REPLACED IT WILL NEED THE MODIFIED BOOTLOADER!!!
+  XXApr2020: Have time off work due to COVID 19. Added a menu time out function. Restructured the code, cleaning up and grouping funtions.
+  09Oct2020: Added minium run times for fan and pumps.
+
+*/
+
+#include <LiquidCrystal.h>
+LiquidCrystal lcd(8, 9, 4, 5, 6, 7);
+
+//Constants for pin assignments
+const int waterheater = 2; // pin to water heater pilot relay. Added 06 Mar 2020
+const int fan = 3; // pin to fan relay
+const int blower = 11; // pin to blower relay
+const int boiler_pump = 12; // pin to pump relay
+const int coil_pump = 13; // pin to pump relay
+const int pin_BL = 10; // arduino pin wired to LCD backlight circuit
+const int keypad_pin = A0; // Keypad input
+const int tank_sensor = A1; // Thermistor input
+const int boiler_sensor = A2; // Thermistor input
+const int air_sensor = A3; // Thermistor input
+const int flue_sensor = A4; // Thermocouple input. Added 01 Mar 2020
+
+//Constants for the thermistors
+const int THERMISTORNOMINAL = 10000; //Resistance value at nominal temp of thermistor
+const int TEMPERATURENOMINAL = 25; // temp. for nominal resistance (almost always 25 C)
+const int NUMSAMPLES = 5; // how many samples to take and average
+const int BCOEFFICIENT = 3950; //B (coefficient) value of thermistor
+const int SERIESRESISTOR = 10000; //Value of fixed resistor
+
+//User variables with default values
+int tank_set_temp = 120; // Tank pump start/stop temp
+int boiler_set_temp = 160; // Glycol pump start/stop temp
+int air_set_temp = 40; // Air temp start/stop for fan
+int tank_range = 10; // Allowed temp drift
+int boiler_range = 20; // Allowed temp drift
+int air_range = 10; // Allowed temp drift
+int BL_level = 50; // LCD back light starting level
+int tank_cal = 0; // Calibration for temp difference
+int boiler_cal = 0; // Calibration for temp difference
+int air_cal = 0; // Calibration for temp difference
+int boiler_min_temp = 140; // Min. boiler temperature
+
+//Nonuser variables
+int keypad_value = 0; // Used in reading keypad
+int keypad_value_old = 0; // Used in reading keypad
+int samples[NUMSAMPLES]; // Sets array for number of samples
+int current_tank_temp; // Temerature from tank sensor
+int current_boiler_temp; // Temperature from boiler sensor
+int current_air_temp; // Temperature from air temp sensor
+int current_flue_temp; //Temperature from flue temp sensor
+int new_tank_temp; // Used for adjusting temp in menu
+int new_boiler_temp; // Used for adjusting temp in menu
+int new_air_temp; // Used for adjusting temp in menu
+int new_boiler_min_temp; // Used for adjusting temp in menu 06Apr2020
+int old_tank_temp; // Used for screen update
+int old_boiler_temp; // Used for screen update
+int old_air_temp; // Used for screen update
+int old_flue_temp; //Used for screen update
+int new_tank_range; // Used for adjusting range
+int new_boiler_range; // Used for adjusting range
+int new_air_range; // Used for adjusting range
+int new_tank_cal; // Used for adjusting cal
+int new_boiler_cal; // Used for adjusting cal
+int new_air_cal; // Used for adjusting cal
+int new_BL_level; // Used for adjusting back light
+
+char btn_push; // Used in menu
+
+byte mainMenuPage = 1; // Used in menu
+byte mainMenuPageOld = 1; // Used in menu
+byte mainMenuTotal = 10; // Used in menu
+
+const int BL_step = 10; // step size for adjusting LCD backlight
+const int menu_time = 10; // Timeout period for menu sitting idle in seconds. 4Apr2020
+
+unsigned long start_delay;
+unsigned long current_delay;
+
+// Variables for boiler lit function.
+
+unsigned long current_time;
+unsigned long previous_time;
+int current_temp;
+int previous_temp;
+int boiler_count;
+int flue_set_temp = 80;
+int new_flue_set;
+int old_flue_set;
+int new_flue_diff;
+int old_flue_diff;
+
+// Variables for operational mode and maintenance menu functions. 06 Mar 2020
+int operation_mode = 0;
+String opMode[] = {"OFF", "ON", "MAINT"};
+byte MaintMenuPage = 1;
+byte MaintMenuPageOld = 1;
+byte MaintMenuTotal = 11;
+
+//Function states.
+bool menu_timeout = false;
+bool boiler_lit;
+bool all_off_run = false;
+bool fan_on = false;
+bool blower_on = false;
+bool waterheater_on = false;
+bool boiler_pump_on = false;
+bool coil_pump_on = false;
+bool over_temp = false;
+
+//Variables for run time delays.
+unsigned long fan_on_time;
+int fan_run_time = 5; //Run time in min.
+unsigned long blower_on_time;
+int blower_run_time = 1; //Run time in min.
+unsigned long boiler_pump_time;
+int boiler_run_time = 5; //Run time in min.
+unsigned long coil_pump_time;
+int coil_run_time = 5; //Run time in min.
+unsigned long waterheater_on_time;
+int waterheater_run_time = 2; //Run time in min.
+
+
+
+void setup()
+{
+  lcd.begin(16, 2); //Initialize a 2x16 type LCD
+
+  //For program testing. Comment out when done.
+  Serial.begin(9600);
+
+  digitalWrite(fan, HIGH); // Turn off fan
+  digitalWrite(blower, HIGH); // Turn off blower
+  digitalWrite(boiler_pump, HIGH); // Turn off pump
+  digitalWrite(coil_pump, HIGH); // Turn off pump
+  digitalWrite(waterheater, LOW); // Turn off waterheater. 06 Mar 2020
+
+  pinMode(keypad_pin, INPUT);     // keypad's input.
+  pinMode(tank_sensor, INPUT); // Thermistor input
+  pinMode(boiler_sensor, INPUT); // Thermistor input
+  pinMode(air_sensor, INPUT); // Thermistor input
+  pinMode(flue_sensor, INPUT); // Thermocouple input
+  pinMode(fan, OUTPUT); // Fan output to relay board to control solid state relay
+  pinMode(blower, OUTPUT); // Blower output to relay board
+  pinMode(boiler_pump, OUTPUT); // Pump output to relay board
+  pinMode(coil_pump, OUTPUT); // Pump output to relay board
+  pinMode(pin_BL, OUTPUT);  // Backlight output to LCD board
+  pinMode(waterheater, OUTPUT); // Waterheater output to pilot relay. 06 Mar 2020
+
+  MainMenuDisplay();
+}
+
+// Main program.
+void loop()
+{
+  analogWrite(pin_BL, BL_level);
+  boiler_state();
+  temp_control();
+  MainControl();
+
+  //For program testing. Comment out when done.
+  print_output();
+
+  // Overheat mode
+  if (over_temp == true)
+  {
+    overtemp();
+    return;
+  }
+  //End
+
+  // Maintenance mode
+  if (operation_mode == 2)
+  {
+    MaintMenu();
+    return;
+  }
+  // End
+
+  MainMenu();
+  all_off_run = false;
+  
+}//--------------- End of loop() loop ---------------------
+
+//-------------Control Functions-------------
+// Function to activate outputs. 14 Mar 2020.
+void MainControl()
+{
+  // Coil fan relay, low on. Provides 5V DC pilot to SSR.
+  if (fan_on == true)
+  {
+    digitalWrite (fan, LOW);
+    fan_on_time = millis();
+  }
+  else if (fan_on == false && (operation_mode != 1 || over_temp == true))
+    digitalWrite (fan, HIGH);
+  else if (fan_on == false && (millis() - fan_on_time) >= (fan_run_time * 60000))
+    digitalWrite (fan, HIGH);
+    
+  // Blower relay, low on.
+  if (blower_on == true)
+  {
+    digitalWrite (blower, LOW);
+    blower_on_time = millis();
+  }
+  else if (blower_on == false && (operation_mode != 1 || over_temp == true))
+    digitalWrite (blower, HIGH);
+  else if (blower_on == false && (millis() - blower_on_time) >= (blower_run_time * 60000))
+    digitalWrite (blower, HIGH);
+    
+  // Boiler pump relay, low on.
+  if (boiler_pump_on == true)
+  {
+    digitalWrite (boiler_pump, LOW);
+    boiler_pump_time = millis();
+  }
+  else if (boiler_pump_on == false && (operation_mode != 1 || over_temp == true))
+    digitalWrite (boiler_pump, HIGH);
+  else if (boiler_pump_on == false && (millis() - boiler_pump_time) >= (boiler_run_time * 60000))
+    digitalWrite (boiler_pump, HIGH);
+    
+  // Coil pump relay, low on.
+  if (coil_pump_on == true)
+  {
+    digitalWrite (coil_pump, LOW);
+    coil_pump_time = millis();
+  }
+  else if (coil_pump_on == false && (operation_mode != 1 || over_temp == true))
+    digitalWrite (coil_pump, HIGH);
+  else if (coil_pump_on == false && (millis() - coil_pump_time) >= (coil_run_time * 60000))
+    digitalWrite (coil_pump, HIGH);
+    
+  // Waterheater relay, high on. Provides 120V AC pilot to contactor.
+  if (waterheater_on == true)
+  {
+    digitalWrite (waterheater, HIGH);
+    waterheater_on_time = millis();
+  }
+  else if (waterheater_on == false && (operation_mode != 1 || over_temp == true))
+    digitalWrite (waterheater, LOW);
+  else if (waterheater_on == false && (millis() - waterheater_on_time) >= (waterheater_run_time * 60000))
+    digitalWrite (waterheater, LOW);
+}
+
+// This is the teperature controller
+void temp_control()
+{
+  old_air_temp = current_air_temp;
+  old_boiler_temp = current_boiler_temp;
+  old_tank_temp = current_tank_temp;
+
+  current_air_temp = get_temp(air_sensor);
+  current_air_temp += air_cal;
+
+  current_boiler_temp = get_temp(boiler_sensor);
+  current_boiler_temp += boiler_cal;
+
+  current_tank_temp = get_temp(tank_sensor);
+  current_tank_temp += tank_cal;
+
+  if (current_boiler_temp < (boiler_set_temp + 20) && current_tank_temp < (tank_set_temp + 20 ))
+  {
+    over_temp = false;
+  }
+  else if (current_boiler_temp > (boiler_set_temp + 20) || current_tank_temp > (tank_set_temp + 20 ))
+  {
+    over_temp = true;
+    return;
+  }
+
+  if (operation_mode == 0)
+  {
+    all_off();
+    return;
+  }
+
+  if (operation_mode == 2)
+  {
+    if (all_off_run == false)
+    {
+      all_off();
+    }
+    return;
+  }
+
+  if (current_air_temp < (air_set_temp - air_range / 2) && current_tank_temp > (tank_set_temp - tank_range / 2))
+  {
+    fan_on = true;
+    coil_pump_on = true;
+  }
+  else if (current_air_temp > (air_set_temp + air_range / 2) || current_tank_temp < (tank_set_temp - tank_range / 2))
+  {
+    fan_on = false;
+    coil_pump_on = false;
+  }
+
+  if (current_boiler_temp < (boiler_set_temp - boiler_range / 2) && boiler_lit == true)
+  {
+    blower_on = true;
+  }
+  else if (current_boiler_temp > (boiler_set_temp + boiler_range / 2) || boiler_lit == false)
+  {
+    blower_on = false;
+  }
+
+  if (current_tank_temp < (tank_set_temp - tank_range / 2) && current_boiler_temp > boiler_min_temp)
+  {
+    boiler_pump_on = true;
+  }
+  else if (current_tank_temp < (tank_set_temp - tank_range / 2) && current_boiler_temp < boiler_min_temp && boiler_lit == true)
+  {
+    boiler_pump_on = false;
+  }
+  else if (current_tank_temp < (tank_set_temp - tank_range / 2) && current_boiler_temp < boiler_min_temp && boiler_lit == false)
+  {
+    boiler_pump_on = false;
+    waterheater_on = true;
+  }
+  else if (current_tank_temp > (tank_set_temp + tank_range / 2))
+  {
+    boiler_pump_on = false;
+    waterheater_on = false;
+  }
+
+}// End of loop.
+//-------------End of Control Functions-------------
+
+//-------------Menu Functions-------------
+// Main menu function
+void MainMenu()
+{
+  btn_push = ReadKeypad();
+
+  MainMenuBtn();
+
+  if (btn_push == 'S') //enter selected menu
+  {
+    WaitBtnRelease();
+    switch (mainMenuPage)
+    {
+      case 1:
+        while (ReadKeypad() != 'S')
+        {
+
+          MainControl();
+          analogWrite(pin_BL, BL_level);
+
+          boiler_state();
+
+          temp_control();
+
+          print_output();
+
+          // Overheat mode
+          if (over_temp == true)
+          {
+            overtemp();
+          }
+          //End
+          
+          else
+          {
+            if (current_tank_temp != old_tank_temp) {
+              print_temp();
+            }
+            else if (current_boiler_temp != old_boiler_temp) {
+              print_temp();
+            }
+            else if (current_air_temp != old_air_temp) {
+              print_temp();
+            }
+          }
+        }
+        break;
+      case 2:
+        operation_mode = Operation(operation_mode, 3);
+        if (operation_mode != 2)
+        {
+          break;
+        }
+        else
+        {
+          MaintMenuDisplay();
+        }
+        break;
+      case 3:
+        air_set_temp = Menu(air_set_temp, new_air_temp, "Air Temp: ");
+        break;
+      case 4:
+        tank_set_temp = Menu(tank_set_temp, new_tank_temp, "Tank Temp: ");
+        break;
+      case 5:
+        boiler_set_temp = Menu(boiler_set_temp, new_boiler_temp, "Boiler Temp: ");
+        break;
+      case 6:
+        flue_set_temp = Menu(flue_set_temp, new_flue_set, "Flue Temp: ");
+        break;
+      case 7:
+        BackLight();
+        break;
+      case 8:
+        air_range = Menu(air_range, new_air_range, "Air Range: ");
+        break;
+      case 9:
+        tank_range = Menu(tank_range, new_tank_range, "Tank Range: ");
+        break;
+      case 10:
+        boiler_range = Menu(boiler_range, new_boiler_range, "Boiler Range: ");
+        break;
+    }
+    MainMenuDisplay();
+    WaitBtnRelease();
+  }
+}
+
+// Prints the menu
+void MainMenuDisplay()
+{
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  switch (mainMenuPage)
+  {
+    case 1:
+      lcd.print("To Exit Menu:");
+      lcd.setCursor(0, 1);
+      lcd.print("Press Select.");
+      break;
+    case 2:
+      lcd.print("Operating Mode?");
+      lcd.setCursor(0, 1);
+      lcd.print(opMode[operation_mode]);
+      break;
+    case 3:
+      lcd.print("Air Set Temp?");
+      lcd.setCursor(0, 1);
+      lcd.print("Current: ");
+      lcd.print(air_set_temp);
+      break;
+    case 4:
+      lcd.print("Tank Set Temp?");
+      lcd.setCursor(0, 1);
+      lcd.print("Current: ");
+      lcd.print(tank_set_temp);
+      break;
+    case 5:
+      lcd.print("Boiler Set Temp?");
+      lcd.setCursor(0, 1);
+      lcd.print("Current: ");
+      lcd.print(boiler_set_temp);
+      break;
+    case 6:
+      lcd.print("Flue Set Temp?");
+      lcd.setCursor(0, 1);
+      lcd.print("Current: ");
+      lcd.print(flue_set_temp);
+      break;
+    case 7:
+      lcd.print("BL Level?");
+      lcd.setCursor(0, 1);
+      lcd.print("Current: ");
+      lcd.print(BL_level);
+      break;
+    case 8:
+      lcd.print("Air Temp. Range?");
+      lcd.setCursor(0, 1);
+      lcd.print("Current: ");
+      lcd.print(air_range);
+      break;
+    case 9:
+      lcd.print("Tank Range?");
+      lcd.setCursor(0, 1);
+      lcd.print("Current: ");
+      lcd.print(tank_range);
+      break;
+    case 10:
+      lcd.print("Boiler Range?");
+      lcd.setCursor(0, 1);
+      lcd.print("Current: ");
+      lcd.print(boiler_range);
+      break;
+  }
+}// End of loop
+
+// Navigates through the menu
+void MainMenuBtn()
+{
+  WaitBtnRelease();
+  if (btn_push == 'R')
+  {
+    mainMenuPage++;
+    if (mainMenuPage > mainMenuTotal)
+      mainMenuPage = 1;
+  }
+  else if (btn_push == 'L')
+  {
+    mainMenuPage--;
+    if (mainMenuPage == 0)
+      mainMenuPage = mainMenuTotal;
+  }
+
+  if (mainMenuPage != mainMenuPageOld) //only update display when page change
+  {
+    MainMenuDisplay();
+    mainMenuPageOld = mainMenuPage;
+  }
+}// End of loop
+
+// Maintenance menu function. 06 Mar 2020
+void MaintMenu()
+{
+  btn_push = ReadKeypad();
+  MaintMenuBtn();
+
+  if (btn_push == 'S') //enter selected menu
+  {
+    WaitBtnRelease();
+    switch (MaintMenuPage)
+    {
+      case 1:
+        operation_mode = Operation(operation_mode, 3);
+        break;
+      case 2:
+        air_cal = Menu(air_cal, new_air_cal, "Air Cal.: ");
+        break;
+      case 3:
+        tank_cal = Menu(tank_cal, new_tank_cal, "Tank Cal.: ");
+        break;
+      case 4:
+        boiler_cal = Menu(boiler_cal, new_boiler_cal, "Boiler Cal.: ");
+        break;
+      case 5:
+        fan_on = Operation(fan_on, 2);
+        break;
+      case 6:
+        blower_on = Operation(blower_on, 2);
+        break;
+      case 7:
+        waterheater_on = Operation(waterheater_on, 2);
+        break;
+      case 8:
+        boiler_pump_on = Operation(boiler_pump_on, 2);
+        break;
+      case 9:
+        coil_pump_on = Operation(coil_pump_on, 2);
+        break;
+      case 10:
+        boiler_min_temp = Menu(boiler_min_temp, new_boiler_min_temp, "Boiler Min: ");
+        break;
+      case 11:
+        current_flue_temp = flue_temp();
+        break;
+    }
+    MaintMenuDisplay();
+    WaitBtnRelease();
+  }
+}
+
+// Prints the maintenance menu. 06 Mar 2020
+void MaintMenuDisplay()
+{
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  switch (MaintMenuPage)
+  {
+    case 1:
+      lcd.print("Operating Mode?");
+      lcd.setCursor(0, 1);
+      lcd.print(opMode[operation_mode]);
+      break;
+    case 2:
+      lcd.print("Air Temp. Cal?");
+      lcd.setCursor(0, 1);
+      lcd.print("Current: ");
+      lcd.print(air_cal);
+      break;
+    case 3:
+      lcd.print("Tank Cal?");
+      lcd.setCursor(0, 1);
+      lcd.print("Current: ");
+      lcd.print(tank_cal);
+      break;
+    case 4:
+      lcd.print("Boiler Cal?");
+      lcd.setCursor(0, 1);
+      lcd.print("Current: ");
+      lcd.print(boiler_cal);
+      break;
+    case 5:
+      lcd.print("Coil Fan?");
+      lcd.setCursor(0, 1);
+      lcd.print(opMode[fan_on]);
+      break;
+    case 6:
+      lcd.print("Boiler Blower?");
+      lcd.setCursor(0, 1);
+      lcd.print(opMode[blower_on]);
+      break;
+    case 7:
+      lcd.print("Water Heater?");
+      lcd.setCursor(0, 1);
+      lcd.print(opMode[waterheater_on]);
+      break;
+    case 8:
+      lcd.print("Boiler Pump?");
+      lcd.setCursor(0, 1);
+      lcd.print(opMode[boiler_pump_on]);
+      break;
+    case 9:
+      lcd.print("Coil Pump?");
+      lcd.setCursor(0, 1);
+      lcd.print(opMode[coil_pump_on]);
+      break;
+    case 10:
+      lcd.print("Boiler Min.?");
+      lcd.setCursor(0, 1);
+      lcd.print("Current: ");
+      lcd.print(boiler_min_temp);
+      break;
+    case 11:
+      lcd.print("Flue Temp (Sel):");
+      lcd.setCursor(0, 1);
+      lcd.print(current_flue_temp);
+      lcd.print((char)223);
+      lcd.print("F");
+      break;
+  }
+}// End of loop
+
+// Navigates through the maintenance menu. 06 Mar 2020
+void MaintMenuBtn()
+{
+  WaitBtnRelease();
+  if (btn_push == 'R')
+  {
+    MaintMenuPage++;
+    if (MaintMenuPage > MaintMenuTotal)
+      MaintMenuPage = 1;
+  }
+  else if (btn_push == 'L')
+  {
+    MaintMenuPage--;
+    if (MaintMenuPage == 0)
+      MaintMenuPage = MaintMenuTotal;
+  }
+
+  if (MaintMenuPage != MaintMenuPageOld) //only update display when page change
+  {
+    MaintMenuDisplay();
+    MaintMenuPageOld = MaintMenuPage;
+  }
+}// End of loop
+
+// Menu functions as defined when called
+int Menu(int menu_item, int changed_item, const char text[])
+{
+  changed_item = menu_item;
+
+  while (ReadKeypad() != 'S')
+  {
+    menu_delay();
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print(text);
+    lcd.print(changed_item);
+    lcd.setCursor(0, 1);
+    lcd.print("Current: ");
+    lcd.print(menu_item);
+
+    if (ReadKeypad() == 'L' || menu_timeout == true)
+    {
+      changed_item = menu_item;
+      menu_timeout = false;
+      start_delay = 0;
+      break;
+    }
+    if (ReadKeypad() == 'U')
+    {
+      changed_item ++;
+      start_delay = 0;
+    }
+    else if (ReadKeypad() == 'D')
+    {
+      changed_item --;
+      start_delay = 0;
+    }
+    delay(50);
+  }
+
+  menu_item = changed_item;
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(text);
+  lcd.print(changed_item);
+  lcd.setCursor(0, 1);
+  lcd.print("Current: ");
+  lcd.print(menu_item);
+
+  while (ReadKeypad() != 'L' || menu_timeout == true)
+  {
+    menu_delay();
+    if (menu_timeout == true)
+    {
+      menu_timeout = false;
+      start_delay = 0;
+      break;
+    }
+  }
+
+  return menu_item;
+}// End of loop
+
+
+// Operation menu function. Added 06 Mar 2020. Modified 13 Mar 2020.
+int Operation(int mode_item, int mode_total)
+{
+  int mode;
+  mode = mode_item;
+
+  while (ReadKeypad() != 'S')
+  {
+    menu_delay();
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Op Mode: ");
+    lcd.print(opMode[mode]);
+    lcd.setCursor(0, 1);
+    lcd.print("Current: ");
+    lcd.print(opMode[mode_item]);
+
+    if (ReadKeypad() == 'L' || menu_timeout == true)
+    {
+      mode = mode_item;
+      menu_timeout = false;
+      start_delay = 0;
+      break;
+    }
+    if (ReadKeypad() == 'U' && mode < (mode_total - 1))
+    {
+      mode ++;
+      start_delay = 0;
+    }
+    else if (ReadKeypad() == 'U' && mode == (mode_total - 1))
+    {
+      mode = 0;
+      start_delay = 0;
+    }
+    if (ReadKeypad() == 'D' && mode > 0)
+    {
+      mode --;
+      start_delay = 0;
+    }
+    else if (ReadKeypad() == 'D' && mode == 0)
+    {
+      mode = (mode_total - 1);
+      start_delay = 0;
+    }
+    delay(250);
+  }
+
+  mode_item = mode;
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Op Mode: ");
+  lcd.print(opMode[mode]);
+  lcd.setCursor(0, 1);
+  lcd.print("Current: ");
+  lcd.print(opMode[mode_item]);
+
+  while (ReadKeypad() != 'L' || menu_timeout == true)
+  {
+    menu_delay();
+    if (menu_timeout == true)
+    {
+      menu_timeout = false;
+      start_delay = 0;
+      break;
+    }
+  }
+  return mode_item;
+}// End of loop
+
+// Back light menu function
+void BackLight()
+{
+  int new_BL_level;
+  new_BL_level = BL_level;
+
+  while (ReadKeypad() != 'S')
+  {
+    menu_delay();
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("BL Level: ");
+    lcd.print(new_BL_level);
+    lcd.setCursor(0, 1);
+    lcd.print("Current: ");
+    lcd.print(BL_level);
+
+    if (ReadKeypad() == 'L' || menu_timeout == true)
+    {
+      new_BL_level = BL_level;
+      menu_timeout = false;
+      start_delay = 0;
+      break;
+    }
+    if (ReadKeypad() == 'U' && new_BL_level < 250)
+    {
+      new_BL_level += BL_step;
+      start_delay = 0;
+    }
+    else if (ReadKeypad() == 'D' && new_BL_level > 0)
+    {
+      new_BL_level -= BL_step;
+      start_delay = 0;
+    }
+    delay(100);
+  }
+
+  BL_level = new_BL_level;
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("BL Level: ");
+  lcd.print(new_BL_level);
+  lcd.setCursor(0, 1);
+  lcd.print("Current: ");
+  lcd.print(BL_level);
+
+  while (ReadKeypad() != 'L' || menu_timeout == true)
+  {
+    menu_delay();
+    if (menu_timeout == true)
+    {
+      menu_timeout = false;
+      start_delay = 0;
+      break;
+    }
+  }
+}// End of loop
+//-------------End of Menu Functions-------------
+
+//-------------Input Functions-------------
+// This reads the specific temp sensor assinged when called and converts it to a temperature
+int get_temp(int sensor)
+{
+  uint8_t i;
+  float average;
+
+  // take N samples in a row, with a slight delay
+  for (i = 0; i < NUMSAMPLES; i++) {
+    samples[i] = analogRead(sensor);
+    delay(10);
+  }
+
+  // get the average of all the samples
+  average = 0;
+  for (i = 0; i < NUMSAMPLES; i++) {
+    average += samples[i];
+  }
+  average /= NUMSAMPLES;
+
+  // convert the value to resistance
+  average = 1023 / average - 1;
+  average = SERIESRESISTOR / average;
+
+  // convert resistance to temperature
+  float steinhart;
+  steinhart = average / THERMISTORNOMINAL;     // (R/Ro)
+  steinhart = log(steinhart);                  // ln(R/Ro)
+  steinhart /= BCOEFFICIENT;                   // 1/B * ln(R/Ro)
+  steinhart += 1.0 / (TEMPERATURENOMINAL + 273.15); // + (1/To)
+  steinhart = 1.0 / steinhart;                 // Invert
+  steinhart -= 273.15;                         // convert to C
+  steinhart = steinhart * 1.8 + 32;           // convert to F
+
+  return steinhart;
+
+}// End loop
+
+// Function to read themocouple on flue.
+int flue_temp()
+{
+  uint8_t i;
+  float average;
+
+  // take N samples in a row, with a slight delay
+  for (i = 0; i < NUMSAMPLES; i++) {
+    samples[i] = analogRead(flue_sensor);
+    delay(10);
+  }
+
+  // get the average of all the samples
+  average = 0;
+  for (i = 0; i < NUMSAMPLES; i++) {
+    average += samples[i];
+  }
+  average /= NUMSAMPLES;
+
+  // Convert average to voltage
+  float voltage;
+  voltage = average * (5 / (pow(2, 10) - 1));
+
+  // Convert voltage to temperature
+  float temperature;
+  temperature = (voltage - 1.25) / 0.005; // Temp in deg C
+  temperature = temperature * 1.8 + 32; // Convert to F
+
+  return temperature;
+
+}//End loop.
+
+// Checks if boiler is lit.
+void boiler_state()
+{
+  old_flue_temp = current_flue_temp;
+  current_flue_temp = flue_temp();
+  current_time = millis();
+  current_temp = flue_temp();
+
+  if (current_time > (previous_time + 10000))
+  {
+    if (current_temp > (previous_temp) && current_temp > flue_set_temp)
+      boiler_lit = true;
+
+    else if (current_temp <= (previous_temp) && current_temp < flue_set_temp)
+      boiler_lit = false;
+
+    previous_temp = current_temp;
+    previous_time = current_time;
+  }
+}//End of loop.
+
+// Reads keypad and returns a value
+char ReadKeypad()
+{
+  /* Keypad button analog Value
+    no button pressed 1023
+    select  741
+    left    503
+    down    326
+    up      142
+    right   0
+  */
+  keypad_value = analogRead(keypad_pin);
+
+  if (keypad_value < 100)
+    return 'R';
+  else if (keypad_value < 200)
+    return 'U';
+  else if (keypad_value < 400)
+    return 'D';
+  else if (keypad_value < 600)
+    return 'L';
+  else if (keypad_value < 800)
+    return 'S';
+  else
+    return 'N';
+
+}// End of loop
+//-------------End of Input Functions-------------
+
+//-------------Utillity Functions-------------
+// This protects the boiler by turning on the coil pump, fan, and boiler pump to cool the boiler until it is back to a safe temp. 12Dec2019
+void overtemp()
+{
+  blower_on = false;
+  fan_on = true;
+  boiler_pump_on = true;
+  coil_pump_on = true;
+  waterheater_on = false;
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Over Temp");
+  lcd.setCursor(0, 2);
+  lcd.print("Boil:");
+  lcd.print(current_boiler_temp);
+  lcd.setCursor(8, 2);
+  lcd.print("Tank:");
+  lcd.print(current_tank_temp);
+}// End of loop.
+
+void menu_delay()
+{
+  if (start_delay == 0)
+    start_delay = millis();
+
+  current_delay = millis();
+
+  if (current_delay >= start_delay + (menu_time * 1000))
+  {
+    menu_timeout = true;
+  }
+}
+
+// Turn off all outputs. 13 Mar 2020
+void all_off()
+{
+  fan_on = false;
+  blower_on = false;
+  waterheater_on = false;
+  boiler_pump_on = false;
+  coil_pump_on = false;
+  all_off_run = true;
+}
+
+// Provides a delay after pressing button
+void WaitBtnRelease()
+{
+  while (analogRead(keypad_pin) < 800) {}
+}// End of loop
+
+// Prints the temperture when called.
+void print_temp()
+{
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Air:");
+  lcd.print(current_air_temp);
+  lcd.setCursor(8, 0);
+  lcd.print("Set:");
+  lcd.print(air_set_temp);
+  lcd.setCursor(0, 2);
+  lcd.print("Boil:");
+  lcd.print(current_boiler_temp);
+  lcd.setCursor(8, 2);
+  lcd.print("Tank:");
+  lcd.print(current_tank_temp);
+}// End of loop
+
+//For program testing. Comment out when done.
+void print_output()
+{
+  Serial.print("Temperatures: ");
+  Serial.print("Flue: ");
+  Serial.print(current_flue_temp);
+  Serial.print("\t");
+  Serial.print("Air: ");
+  Serial.print(current_air_temp);
+  Serial.print("\t");
+  Serial.print("Boil: ");
+  Serial.print(current_boiler_temp);
+  Serial.print("\t");
+  Serial.print("Tank: ");
+  Serial.print(current_tank_temp);
+  Serial.print("\t");
+  Serial.print("Boiler lit: ");
+  Serial.print(boiler_lit);
+  Serial.print("\t");
+  Serial.print(current_time);
+  Serial.print("\t");
+  Serial.print(previous_time);
+  Serial.print("\t");
+  Serial.print(current_temp);
+  Serial.print("\t");
+  Serial.print(previous_temp);
+  Serial.print("\t");
+  Serial.print("Blower: ");
+  Serial.print(blower_on);
+  Serial.print("\t");
+  Serial.print("Fan: ");
+  Serial.print(fan_on);
+  Serial.print("\t");
+  Serial.print("Boiler Pump: ");
+  Serial.print(boiler_pump_on);
+  Serial.print("\t");
+  Serial.print("Coil Pump: ");
+  Serial.print(coil_pump_on);
+  Serial.print("\t");
+  Serial.print("Waterheater: ");
+  Serial.print(waterheater_on);
+  Serial.print("\t");
+  Serial.print("All Off: ");
+  Serial.println(all_off_run);
+  delay(5);
+}// End of loop.
+//-------------End of Utillity Functions-------------
